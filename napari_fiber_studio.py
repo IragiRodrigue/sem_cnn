@@ -83,6 +83,12 @@ def run_app(image_path: str | None = None) -> None:
     image_layer = viewer.add_image(np.zeros((32, 32), dtype=np.uint8), name="Original Image")
     proposal_layer = viewer.add_labels(np.zeros((32, 32), dtype=np.int32), name="SAM Proposals")
     instance_layer = viewer.add_labels(np.zeros((32, 32), dtype=np.int32), name="Instance Labels")
+    selected_proposal_layer = viewer.add_labels(
+        np.zeros((32, 32), dtype=np.int32), name="Selected Proposal"
+    )
+    selected_instance_layer = viewer.add_labels(
+        np.zeros((32, 32), dtype=np.int32), name="Selected Instance"
+    )
     keypoints_layer = viewer.add_points(np.empty((0, 2)), name="Keypoints", size=7, face_color="yellow")
     prompt_points_layer = viewer.add_points(
         np.empty((0, 2)),
@@ -102,6 +108,10 @@ def run_app(image_path: str | None = None) -> None:
     proposal_layer.opacity = 0.35
     instance_layer.opacity = 0.55
     instance_layer.editable = True
+    selected_proposal_layer.opacity = 0.9
+    selected_instance_layer.opacity = 0.95
+    selected_proposal_layer.editable = False
+    selected_instance_layer.editable = False
 
     if hasattr(keypoints_layer, "border_color"):
         keypoints_layer.border_color = "black"
@@ -129,6 +139,8 @@ def run_app(image_path: str | None = None) -> None:
         image_layer.data = np.zeros(shape, dtype=np.uint8)
         proposal_layer.data = state.proposal_labels.copy()
         instance_layer.data = state.instance_labels.copy()
+        selected_proposal_layer.data = np.zeros(shape, dtype=np.int32)
+        selected_instance_layer.data = np.zeros(shape, dtype=np.int32)
         keypoints_layer.data = np.empty((0, 2))
         prompt_points_layer.data = np.empty((0, 2))
         prompt_points_layer.properties = {"label": np.array([], dtype=int)}
@@ -173,13 +185,42 @@ def run_app(image_path: str | None = None) -> None:
             item.setData(Qt.UserRole, proposal_id)
             proposal_list.addItem(item)
 
+    def update_instance_list() -> None:
+        instance_list.clear()
+        if state.instance_labels is None:
+            return
+        max_id = int(state.instance_labels.max())
+        for instance_id in range(1, max_id + 1):
+            pixel_count = int(np.sum(state.instance_labels == instance_id))
+            if pixel_count == 0:
+                continue
+            prefix = "*" if instance_id == state.selected_instance_id else " "
+            text = f"{prefix} instance {instance_id} | {pixel_count} px"
+            item = QListWidgetItem(text)
+            item.setData(Qt.UserRole, instance_id)
+            instance_list.addItem(item)
+
     def refresh_layers() -> None:
         if state.proposal_labels is None or state.instance_labels is None:
             return
         proposal_layer.data = state.proposal_labels.copy()
         instance_layer.data = state.instance_labels.copy()
         update_list()
+        update_instance_list()
         update_selected_keypoints()
+        update_selection_overlays()
+
+    def update_selection_overlays() -> None:
+        if state.proposal_labels is None or state.instance_labels is None:
+            return
+        proposal_overlay = np.zeros_like(state.proposal_labels, dtype=np.int32)
+        instance_overlay = np.zeros_like(state.instance_labels, dtype=np.int32)
+        if state.selected_proposal_id is not None:
+            proposal_overlay[state.proposal_labels == state.selected_proposal_id] = 1
+        if state.selected_instance_id is not None:
+            instance_overlay[state.instance_labels == state.selected_instance_id] = 1
+        selected_proposal_layer.data = proposal_overlay
+        selected_instance_layer.data = instance_overlay
 
     def labels_to_color_map(max_label: int, selected_label: int | None, selected_color: str, default_color: str) -> dict[int | None, str]:
         color_map: dict[int | None, str] = {None: "transparent", 0: "transparent"}
@@ -195,6 +236,14 @@ def run_app(image_path: str | None = None) -> None:
                 "white",
                 "orange",
             )
+        except Exception:
+            pass
+        try:
+            selected_proposal_layer.color = {None: "transparent", 0: "transparent", 1: "white"}
+        except Exception:
+            pass
+        try:
+            selected_instance_layer.color = {None: "transparent", 0: "transparent", 1: "cyan"}
         except Exception:
             pass
         try:
@@ -316,16 +365,21 @@ def run_app(image_path: str | None = None) -> None:
 
     def select_proposal(proposal_id: int | None) -> None:
         state.selected_proposal_id = proposal_id
+        if hasattr(proposal_layer, "selected_label"):
+            proposal_layer.selected_label = int(proposal_id or 0)
         if proposal_id in state.proposals:
             proposal = state.proposals[proposal_id]
             set_status(
                 f"Selected proposal {proposal_id} | score={proposal.score:.3f} | quality={proposal.quality_reason}"
             )
         update_list()
+        update_selection_overlays()
         update_color_maps()
 
     def select_instance(instance_id: int | None) -> None:
         state.selected_instance_id = instance_id
+        if hasattr(instance_layer, "selected_label"):
+            instance_layer.selected_label = int(instance_id or 0)
         update_selected_keypoints()
         if instance_id is not None:
             candidate = best_effort_candidate_for_instance(instance_id)
@@ -334,6 +388,7 @@ def run_app(image_path: str | None = None) -> None:
                     f"Selected instance {instance_id} | len={candidate.fiber_length:.1f}px "
                     f"| width={candidate.fiber_width:.1f}px | spline IoU={candidate.spline_mask_iou:.2f}"
                 )
+        update_selection_overlays()
         update_color_maps()
 
     def run_auto_sam() -> None:
@@ -456,7 +511,21 @@ def run_app(image_path: str | None = None) -> None:
             viewer.layers.selection.active = instance_layer
             if hasattr(instance_layer, "mode"):
                 instance_layer.mode = "paint"
+            if state.selected_instance_id is not None and hasattr(instance_layer, "selected_label"):
+                instance_layer.selected_label = int(state.selected_instance_id)
             set_status("Use napari paint/erase/fill tools on the Instance Labels layer.")
+        elif mode == "erase_instances":
+            viewer.layers.selection.active = instance_layer
+            if hasattr(instance_layer, "mode"):
+                instance_layer.mode = "erase"
+            set_status("Erase pixels directly in the Instance Labels layer.")
+        elif mode == "fill_instances":
+            viewer.layers.selection.active = instance_layer
+            if hasattr(instance_layer, "mode"):
+                instance_layer.mode = "fill"
+            if state.selected_instance_id is not None and hasattr(instance_layer, "selected_label"):
+                instance_layer.selected_label = int(state.selected_instance_id)
+            set_status("Fill contiguous pixels into the selected instance label.")
         elif mode == "edit_keypoints":
             viewer.layers.selection.active = keypoints_layer
             if hasattr(keypoints_layer, "mode"):
@@ -533,6 +602,29 @@ def run_app(image_path: str | None = None) -> None:
         refresh_layers()
         update_color_maps()
         set_status(f"Instances compacted into {int(relabeled.max())} labels.")
+
+    def create_empty_instance_for_painting() -> None:
+        if state.instance_labels is None:
+            set_status("Create Instance Labels first.")
+            return
+        state.selected_instance_id = state.next_instance_id
+        state.next_instance_id += 1
+        if hasattr(instance_layer, "selected_label"):
+            instance_layer.selected_label = int(state.selected_instance_id)
+        viewer.layers.selection.active = instance_layer
+        if hasattr(instance_layer, "mode"):
+            instance_layer.mode = "paint"
+        refresh_layers()
+        update_color_maps()
+        set_status(f"New empty instance {state.selected_instance_id} ready for painting.")
+
+    def sync_instance_layer_from_manual_edits() -> None:
+        state.instance_labels = np.asarray(instance_layer.data, dtype=np.int32).copy()
+        if state.instance_labels.size:
+            state.next_instance_id = int(state.instance_labels.max()) + 1
+        refresh_layers()
+        update_color_maps()
+        set_status("Manual edits synchronized from the Instance Labels layer.")
 
     def build_candidates_for_export() -> list[FiberCandidate]:
         candidates: list[FiberCandidate] = []
@@ -707,6 +799,38 @@ def run_app(image_path: str | None = None) -> None:
             select_proposal(None)
             set_status(f"No mask at ({row}, {col}).")
 
+    @proposal_layer.mouse_drag_callbacks.append
+    def handle_proposal_click(layer, event):
+        if state.proposal_labels is None:
+            return
+        yield
+        if event.type != "mouse_press":
+            return
+        pos = layer.world_to_data(event.position)
+        row = int(round(pos[0]))
+        col = int(round(pos[1]))
+        if row < 0 or col < 0 or row >= state.proposal_labels.shape[0] or col >= state.proposal_labels.shape[1]:
+            return
+        proposal_id = int(state.proposal_labels[row, col])
+        if proposal_id > 0:
+            select_proposal(proposal_id)
+
+    @instance_layer.mouse_drag_callbacks.append
+    def handle_instance_click(layer, event):
+        if state.instance_labels is None:
+            return
+        yield
+        if event.type != "mouse_press":
+            return
+        pos = layer.world_to_data(event.position)
+        row = int(round(pos[0]))
+        col = int(round(pos[1]))
+        if row < 0 or col < 0 or row >= state.instance_labels.shape[0] or col >= state.instance_labels.shape[1]:
+            return
+        instance_id = int(state.instance_labels[row, col])
+        if instance_id > 0:
+            select_instance(instance_id)
+
     control_widget = QWidget()
     control_layout = QVBoxLayout(control_widget)
     control_layout.setContentsMargins(12, 12, 12, 12)
@@ -736,6 +860,10 @@ def run_app(image_path: str | None = None) -> None:
     make_button("Delete Proposals In ROI", delete_proposals_in_roi)
     make_button("Erase Instance Pixels In ROI", erase_instance_pixels_in_roi)
     make_button("Edit Instances", lambda: set_prompt_mode("edit_instances"))
+    make_button("Erase Instances", lambda: set_prompt_mode("erase_instances"))
+    make_button("Fill Selected Instance", lambda: set_prompt_mode("fill_instances"))
+    make_button("New Empty Instance", create_empty_instance_for_painting)
+    make_button("Sync Manual Edits", sync_instance_layer_from_manual_edits)
     make_button("Edit Keypoints", lambda: set_prompt_mode("edit_keypoints"))
     make_button("Refine Spline", refine_spline)
     make_button("Compact Labels", relabel_instances_compact)
@@ -830,6 +958,9 @@ def run_app(image_path: str | None = None) -> None:
     right_layout.addWidget(QLabel("SAM Proposals"))
     proposal_list = QListWidget()
     right_layout.addWidget(proposal_list)
+    right_layout.addWidget(QLabel("Instances"))
+    instance_list = QListWidget()
+    right_layout.addWidget(instance_list)
 
     def on_list_selection() -> None:
         current = proposal_list.currentItem()
@@ -839,6 +970,15 @@ def run_app(image_path: str | None = None) -> None:
         select_proposal(proposal_id)
 
     proposal_list.itemSelectionChanged.connect(on_list_selection)
+
+    def on_instance_list_selection() -> None:
+        current = instance_list.currentItem()
+        if current is None:
+            return
+        instance_id = int(current.data(Qt.UserRole))
+        select_instance(instance_id)
+
+    instance_list.itemSelectionChanged.connect(on_instance_list_selection)
     viewer.window.add_dock_widget(right_widget, area="right", name="Review")
 
     if image_path:
