@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -43,6 +44,8 @@ def run_app(image_path: str | None = None) -> None:
             QFormLayout,
             QFrame,
             QHBoxLayout,
+            QListWidget,
+            QListWidgetItem,
             QLabel,
             QPushButton,
             QSlider,
@@ -65,6 +68,13 @@ def run_app(image_path: str | None = None) -> None:
 
     image_layer = viewer.add_image(np.zeros((32, 32), dtype=np.uint8), name="Original Image")
     sam_masks_layer = viewer.add_labels(np.zeros((32, 32), dtype=np.int32), name="SAM Masks")
+    fiber_paths_layer = viewer.add_shapes(
+        name="Fiber Paths",
+        shape_type="path",
+        edge_width=3.0,
+        edge_color="green",
+        face_color="transparent",
+    )
     skeletons_layer = viewer.add_shapes(
         name="Fiber Skeletons",
         shape_type="path",
@@ -78,16 +88,12 @@ def run_app(image_path: str | None = None) -> None:
         name="Keypoints",
         size=6,
         face_color="yellow",
-        edge_color="black",
-        edge_width=0.3,
     )
     prompt_points_layer = viewer.add_points(
         np.empty((0, 2)),
         name="Prompt Points",
         size=9,
         face_color="lime",
-        edge_color="black",
-        edge_width=0.5,
         properties={"label": np.array([], dtype=int)},
         text={"string": "{label}", "color": "white", "size": 8},
     )
@@ -102,6 +108,15 @@ def run_app(image_path: str | None = None) -> None:
     for layer in [sam_masks_layer, final_layer]:
         layer.opacity = 0.45
 
+    if hasattr(keypoints_layer, "border_color"):
+        keypoints_layer.border_color = "black"
+    if hasattr(keypoints_layer, "border_width"):
+        keypoints_layer.border_width = 0.3
+    if hasattr(prompt_points_layer, "border_color"):
+        prompt_points_layer.border_color = "black"
+    if hasattr(prompt_points_layer, "border_width"):
+        prompt_points_layer.border_width = 0.5
+
     sam_masks_layer.visible = True
     final_layer.visible = True
 
@@ -113,6 +128,8 @@ def run_app(image_path: str | None = None) -> None:
         image_layer.data = np.zeros(shape, dtype=np.uint8)
         sam_masks_layer.data = np.zeros(shape, dtype=np.int32)
         final_layer.data = np.zeros(shape, dtype=np.int32)
+        fiber_paths_layer.data = []
+        fiber_paths_layer.edge_color = []
         skeletons_layer.data = []
         keypoints_layer.data = np.empty((0, 2))
         prompt_points_layer.data = np.empty((0, 2))
@@ -173,6 +190,40 @@ def run_app(image_path: str | None = None) -> None:
             "index": np.arange(1, len(candidate.keypoints_rc) + 1, dtype=int)
         }
         keypoints_layer.text = {"string": "{index}", "color": "yellow", "size": 9}
+        if hasattr(keypoints_layer, "mode"):
+            keypoints_layer.mode = "select"
+
+    def update_rejected_list() -> None:
+        rejected_list.clear()
+        for item in state.rejected:
+            text = f"mask {item['mask_index']} | {item['reason']}"
+            widget_item = QListWidgetItem(text)
+            rejected_list.addItem(widget_item)
+
+    def render_overview_paths() -> None:
+        path_data = []
+        path_colors = []
+        for fiber_id, candidate in sorted(state.accepted.items()):
+            path_data.append(np.asarray(candidate.keypoints_rc, dtype=np.float32))
+            path_colors.append("cyan" if fiber_id == state.selected_fiber_id else "lime")
+        for item in state.rejected:
+            mask = item.get("binary_mask")
+            if mask is None or not np.any(mask):
+                continue
+            ys, xs = np.where(mask > 0)
+            if len(xs) < 2:
+                continue
+            y0, y1 = int(np.min(ys)), int(np.max(ys))
+            x0, x1 = int(np.min(xs)), int(np.max(xs))
+            path_data.append(
+                np.asarray(
+                    [[y0, x0], [y0, x1], [y1, x1], [y1, x0], [y0, x0]],
+                    dtype=np.float32,
+                )
+            )
+            path_colors.append("red")
+        fiber_paths_layer.data = path_data
+        fiber_paths_layer.edge_color = path_colors
 
     def render_all() -> None:
         if state.working_image is None:
@@ -180,6 +231,8 @@ def run_app(image_path: str | None = None) -> None:
         sam_masks_layer.data = labels_from_raw_masks(state.working_image.shape, state.raw_masks)
         final_candidates = list(state.accepted.values())
         final_layer.data = labels_from_candidates(state.working_image.shape, final_candidates)
+        render_overview_paths()
+        update_rejected_list()
 
         if state.selected_fiber_id in state.accepted:
             render_selected(state.accepted[state.selected_fiber_id])
@@ -469,6 +522,233 @@ def run_app(image_path: str | None = None) -> None:
             render_all()
             set_status(f"No accepted fiber at ({row}, {col}).")
 
+    def serialize_candidate(candidate: FiberCandidate) -> dict[str, Any]:
+        return {
+            "fiber_id": candidate.fiber_id,
+            "source": candidate.source,
+            "mask_index": candidate.mask_index,
+            "preprocess_variant": candidate.preprocess_variant,
+            "binary_mask": candidate.binary_mask.tolist(),
+            "final_mask": candidate.final_mask.tolist(),
+            "spline_mask": candidate.spline_mask.tolist(),
+            "keypoints_rc": [list(point) for point in candidate.keypoints_rc],
+            "visibility": candidate.visibility,
+            "visible_keypoints": candidate.visible_keypoints,
+            "keypoint_strategy": candidate.keypoint_strategy,
+            "fiber_width": candidate.fiber_width,
+            "fiber_length": candidate.fiber_length,
+            "fiber_curvature": candidate.fiber_curvature,
+            "fiber_orientation": candidate.fiber_orientation,
+            "spline_mask_iou": candidate.spline_mask_iou,
+            "skeleton_stats": candidate.skeleton_stats,
+            "bbox": candidate.bbox,
+            "area": candidate.area,
+            "polygons": candidate.polygons,
+            "metadata": candidate.metadata,
+            "has_bead": candidate.has_bead,
+            "is_blurry": candidate.is_blurry,
+            "is_crossing": candidate.is_crossing,
+        }
+
+    def deserialize_candidate(payload: dict[str, Any]) -> FiberCandidate:
+        return FiberCandidate(
+            fiber_id=int(payload["fiber_id"]),
+            source=payload["source"],
+            mask_index=int(payload["mask_index"]),
+            preprocess_variant=payload["preprocess_variant"],
+            binary_mask=np.asarray(payload["binary_mask"], dtype=np.uint8),
+            final_mask=np.asarray(payload["final_mask"], dtype=np.uint8),
+            spline_mask=np.asarray(payload["spline_mask"], dtype=np.uint8),
+            keypoints_rc=[tuple(point) for point in payload["keypoints_rc"]],
+            visibility=[int(v) for v in payload["visibility"]],
+            visible_keypoints=int(payload["visible_keypoints"]),
+            keypoint_strategy=payload["keypoint_strategy"],
+            fiber_width=float(payload["fiber_width"]),
+            fiber_length=float(payload["fiber_length"]),
+            fiber_curvature=float(payload["fiber_curvature"]),
+            fiber_orientation=float(payload["fiber_orientation"]),
+            spline_mask_iou=float(payload["spline_mask_iou"]),
+            skeleton_stats=payload["skeleton_stats"],
+            bbox=[int(v) for v in payload["bbox"]],
+            area=float(payload["area"]),
+            polygons=payload["polygons"],
+            metadata=payload.get("metadata", {}),
+            has_bead=bool(payload.get("has_bead", False)),
+            is_blurry=bool(payload.get("is_blurry", False)),
+            is_crossing=bool(payload.get("is_crossing", False)),
+        )
+
+    def save_session() -> None:
+        if state.working_image is None or state.image_path is None:
+            set_status("Load an image before saving a session.")
+            return
+        default_output = state.image_path.with_suffix(".fiber.session.json")
+        chosen, _ = QFileDialog.getSaveFileName(
+            viewer.window.qt_viewer,
+            "Save Session",
+            str(default_output),
+            "JSON (*.json)",
+        )
+        if not chosen:
+            return
+        payload = {
+            "image_path": str(state.image_path),
+            "accepted": [serialize_candidate(candidate) for candidate in state.accepted.values()],
+            "rejected": [
+                {
+                    "mask_index": item["mask_index"],
+                    "reason": item["reason"],
+                    "binary_mask": np.asarray(item["binary_mask"], dtype=np.uint8).tolist(),
+                }
+                for item in state.rejected
+            ],
+            "raw_masks": [
+                {
+                    "segmentation": np.asarray(mask["segmentation"], dtype=bool).tolist(),
+                    "bbox": mask.get("bbox"),
+                    "area": float(mask.get("area", 0.0)),
+                    "predicted_iou": float(mask.get("predicted_iou", 0.0)),
+                    "stability_score": float(mask.get("stability_score", 0.0)),
+                    "preprocess_variant": mask.get("preprocess_variant", "raw"),
+                }
+                for mask in state.raw_masks
+            ],
+            "selected_fiber_id": state.selected_fiber_id,
+            "next_fiber_id": state.next_fiber_id,
+            "config": {
+                "min_mask_area": config.min_mask_area,
+                "min_fiber_length_px": config.min_fiber_length_px,
+                "final_mask_iou_dedup_threshold": config.final_mask_iou_dedup_threshold,
+                "min_spline_mask_iou": config.min_spline_mask_iou,
+            },
+        }
+        Path(chosen).write_text(json.dumps(payload), encoding="utf-8")
+        set_status(f"Session saved to {chosen}")
+
+    def load_session() -> None:
+        chosen, _ = QFileDialog.getOpenFileName(
+            viewer.window.qt_viewer,
+            "Load Session",
+            str(Path.cwd()),
+            "JSON (*.json)",
+        )
+        if not chosen:
+            return
+        payload = json.loads(Path(chosen).read_text(encoding="utf-8"))
+        load_image(payload["image_path"])
+        state.accepted = {
+            item["fiber_id"]: deserialize_candidate(item) for item in payload.get("accepted", [])
+        }
+        state.rejected = [
+            {
+                "mask_index": item["mask_index"],
+                "reason": item["reason"],
+                "binary_mask": np.asarray(item["binary_mask"], dtype=np.uint8),
+                "mask_data": {"segmentation": np.asarray(item["binary_mask"], dtype=np.uint8) > 0},
+            }
+            for item in payload.get("rejected", [])
+        ]
+        state.raw_masks = [
+            {
+                "segmentation": np.asarray(mask["segmentation"], dtype=bool),
+                "bbox": mask.get("bbox"),
+                "area": float(mask.get("area", 0.0)),
+                "predicted_iou": float(mask.get("predicted_iou", 0.0)),
+                "stability_score": float(mask.get("stability_score", 0.0)),
+                "preprocess_variant": mask.get("preprocess_variant", "raw"),
+            }
+            for mask in payload.get("raw_masks", [])
+        ]
+        state.selected_fiber_id = payload.get("selected_fiber_id")
+        state.next_fiber_id = int(payload.get("next_fiber_id", len(state.accepted) + 1))
+        cfg = payload.get("config", {})
+        config.min_mask_area = int(cfg.get("min_mask_area", config.min_mask_area))
+        config.min_fiber_length_px = float(
+            cfg.get("min_fiber_length_px", config.min_fiber_length_px)
+        )
+        config.final_mask_iou_dedup_threshold = float(
+            cfg.get(
+                "final_mask_iou_dedup_threshold",
+                config.final_mask_iou_dedup_threshold,
+            )
+        )
+        config.min_spline_mask_iou = float(
+            cfg.get("min_spline_mask_iou", config.min_spline_mask_iou)
+        )
+        render_all()
+        set_status(f"Session loaded from {chosen}")
+
+    def force_accept_selected_reject() -> None:
+        current_row = rejected_list.currentRow()
+        if current_row < 0 or current_row >= len(state.rejected):
+            set_status("Select a rejected fiber first.")
+            return
+        item = state.rejected.pop(current_row)
+        candidate, reason = build_candidate_from_mask(
+            np.asarray(item["binary_mask"], dtype=np.uint8),
+            state.working_image,
+            config,
+            fiber_id=state.next_fiber_id,
+            source=state.image_path.name if state.image_path else "unknown",
+            mask_index=int(item["mask_index"]),
+            preprocess_variant="forced_accept",
+            extra_metadata={"forced_accept_reason": item["reason"]},
+        )
+        if candidate is None:
+            fallback_mask = np.asarray(item["binary_mask"], dtype=np.uint8)
+            direct_candidate = FiberCandidate(
+                fiber_id=state.next_fiber_id,
+                source=state.image_path.name if state.image_path else "unknown",
+                mask_index=int(item["mask_index"]),
+                preprocess_variant="forced_accept_raw",
+                binary_mask=fallback_mask.copy(),
+                final_mask=fallback_mask.copy(),
+                spline_mask=fallback_mask.copy(),
+                keypoints_rc=[(0, 0), (0, 1)],
+                visibility=[1, 1],
+                visible_keypoints=2,
+                keypoint_strategy=f"forced:{reason}",
+                fiber_width=0.0,
+                fiber_length=0.0,
+                fiber_curvature=0.0,
+                fiber_orientation=0.0,
+                spline_mask_iou=0.0,
+                skeleton_stats={"forced": True, "reject_reason": item["reason"]},
+                bbox=[0, 0, 1, 1],
+                area=float(np.sum(fallback_mask > 0)),
+                polygons=[],
+                metadata={"forced_accept_reason": item["reason"]},
+            )
+            bbox = cv2.boundingRect(fallback_mask)
+            direct_candidate.bbox = [int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])]
+            contours, _ = cv2.findContours(
+                fallback_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            direct_candidate.polygons = [
+                contour.flatten().tolist() for contour in contours if contour.size >= 6
+            ]
+            ys, xs = np.where(fallback_mask > 0)
+            if len(xs) >= 2:
+                direct_candidate.keypoints_rc = [
+                    (int(ys.min()), int(xs.min())),
+                    (int(ys.max()), int(xs.max())),
+                ]
+            candidate = direct_candidate
+
+        assign_candidate(candidate)
+        state.raw_masks.append(
+            {
+                "segmentation": np.asarray(candidate.final_mask > 0, dtype=bool),
+                "bbox": candidate.bbox,
+                "area": candidate.area,
+                "predicted_iou": 0.0,
+                "stability_score": 0.0,
+                "preprocess_variant": candidate.preprocess_variant,
+            }
+        )
+        render_all()
+        set_status(f"Rejected mask {item['mask_index']} forced into accepted set.")
+
     control_widget = QWidget()
     control_layout = QVBoxLayout(control_widget)
     control_layout.setContentsMargins(12, 12, 12, 12)
@@ -499,6 +779,9 @@ def run_app(image_path: str | None = None) -> None:
     make_button("Box Prompt", on_box_prompt)
     make_button("Refine Spline", refine_spline)
     make_button("Reject Fiber", reject_selected)
+    make_button("Force Accept Reject", force_accept_selected_reject)
+    make_button("Save Session", save_session)
+    make_button("Load Session", load_session)
 
     separator = QFrame()
     separator.setFrameShape(QFrame.HLine)
@@ -621,6 +904,18 @@ def run_app(image_path: str | None = None) -> None:
     top_layout.addWidget(clear_prompt_button)
     top_layout.addStretch(1)
     viewer.window.add_dock_widget(top_bar, area="top", name="Segmentation")
+
+    right_widget = QWidget()
+    right_layout = QVBoxLayout(right_widget)
+    right_layout.setContentsMargins(10, 10, 10, 10)
+    right_layout.setSpacing(8)
+    right_layout.addWidget(QLabel("Rejected Fibers"))
+    rejected_list = QListWidget()
+    right_layout.addWidget(rejected_list)
+    force_button = QPushButton("Force Accept Selected")
+    force_button.clicked.connect(force_accept_selected_reject)
+    right_layout.addWidget(force_button)
+    viewer.window.add_dock_widget(right_widget, area="right", name="Review")
 
     if image_path:
         load_image(image_path)
