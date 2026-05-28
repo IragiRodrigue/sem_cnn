@@ -1,0 +1,17 @@
+__pycache__
+.fiberseg_pipeline_runs
+debug
+evaluation_outputs
+fibercnn
+logs
+venv
+sam_checkpoint
+*.pt
+*.pth
+*.log
+*.csv
+outputs
+output
+node_modules
+images
+historique
