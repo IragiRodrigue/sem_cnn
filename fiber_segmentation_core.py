@@ -596,6 +596,7 @@ def build_candidate_from_mask(
     mask_index: int,
     preprocess_variant: str = "prompted",
     extra_metadata: dict[str, Any] | None = None,
+    validate: bool = True,
 ) -> tuple[FiberCandidate | None, str]:
     points, visible_keypoints, keypoint_strategy, visibility, skeleton_stats = extract_ordered_keypoints(
         binary_mask, config
@@ -611,7 +612,7 @@ def build_candidate_from_mask(
     is_valid, reject_reason = evaluate_candidate_fiber(
         skeleton_stats, fiber_width, fiber_length, spline_mask_iou, config
     )
-    if not is_valid:
+    if validate and not is_valid:
         return None, reject_reason
 
     final_mask = spline_mask if np.any(spline_mask) else binary_mask
@@ -651,7 +652,19 @@ def build_candidate_from_mask(
             is_blurry=is_blurry,
             is_crossing=is_crossing,
         ),
-        "accepted",
+        "accepted" if is_valid else reject_reason,
+    )
+
+
+def assess_candidate_quality(
+    candidate: FiberCandidate, config: PipelineConfig
+) -> tuple[bool, str]:
+    return evaluate_candidate_fiber(
+        candidate.skeleton_stats,
+        candidate.fiber_width,
+        candidate.fiber_length,
+        candidate.spline_mask_iou,
+        config,
     )
 
 
