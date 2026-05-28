@@ -10,7 +10,7 @@ import numpy as np
 from scipy import interpolate
 from scipy.spatial.distance import pdist, squareform
 from skimage.filters import frangi
-from skimage.morphology import skeletonize
+from skimage.morphology import medial_axis
 
 
 @dataclass
@@ -213,8 +213,7 @@ def deduplicate_masks(
     return sorted(kept, key=lambda m: (int(m["bbox"][1]), int(m["bbox"][0])))
 
 
-def build_skeleton_graph(binary_mask: np.ndarray) -> tuple[np.ndarray, np.ndarray, nx.Graph]:
-    skeleton = skeletonize(binary_mask > 0)
+def graph_from_skeleton_mask(skeleton: np.ndarray) -> tuple[np.ndarray, nx.Graph]:
     points = np.argwhere(skeleton)
     graph = nx.Graph()
     point_set = set(map(tuple, points))
@@ -235,7 +234,67 @@ def build_skeleton_graph(binary_mask: np.ndarray) -> tuple[np.ndarray, np.ndarra
             if neighbor in point_set:
                 graph.add_edge(point_tuple, neighbor, weight=1)
 
-    return skeleton, points, graph
+    return points, graph
+
+
+def _trace_branch_path(
+    graph: nx.Graph, endpoint: tuple[int, int]
+) -> list[tuple[int, int]]:
+    path = [endpoint]
+    previous = None
+    current = endpoint
+
+    while True:
+        neighbors = [node for node in graph.neighbors(current) if node != previous]
+        if len(neighbors) != 1:
+            break
+        nxt = neighbors[0]
+        path.append(nxt)
+        previous, current = current, nxt
+        if graph.degree(current) != 2:
+            break
+    return path
+
+
+def prune_short_spurs(graph: nx.Graph, min_branch_length: int) -> nx.Graph:
+    pruned = graph.copy()
+    if min_branch_length <= 0:
+        return pruned
+
+    changed = True
+    while changed and pruned.number_of_nodes() > 2:
+        changed = False
+        endpoints = [node for node, degree in pruned.degree() if degree == 1]
+        for endpoint in endpoints:
+            if endpoint not in pruned:
+                continue
+            path = _trace_branch_path(pruned, endpoint)
+            if len(path) < 2:
+                continue
+            terminal = path[-1]
+            terminal_degree = pruned.degree(terminal)
+            branch_length = len(path) - 1
+            if terminal_degree >= 3 and branch_length < min_branch_length:
+                pruned.remove_nodes_from(path[:-1])
+                changed = True
+                break
+    return pruned
+
+
+def build_skeleton_graph(binary_mask: np.ndarray) -> tuple[np.ndarray, np.ndarray, nx.Graph]:
+    skeleton = medial_axis(binary_mask > 0)
+    points, graph = graph_from_skeleton_mask(skeleton)
+    if graph.number_of_nodes() == 0:
+        return skeleton.astype(bool), points, graph
+
+    area = max(int(np.sum(binary_mask > 0)), 1)
+    dynamic_prune = max(4, int(np.sqrt(area) * 0.08))
+    pruned_graph = prune_short_spurs(graph, min_branch_length=dynamic_prune)
+    pruned_points = np.array(list(pruned_graph.nodes()), dtype=int) if pruned_graph.number_of_nodes() else np.empty((0, 2), dtype=int)
+    pruned_skeleton = np.zeros_like(binary_mask, dtype=bool)
+    if len(pruned_points):
+        pruned_skeleton[pruned_points[:, 0], pruned_points[:, 1]] = True
+    return pruned_skeleton, pruned_points, pruned_graph
 
 
 def normalize_path_direction(path: list[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -520,7 +579,7 @@ def analyze_fiber_complexity(mask: np.ndarray, image_gray: np.ndarray) -> tuple[
     blur_score = cv2.Laplacian(roi, cv2.CV_64F).var() if roi.size else 0.0
     is_blurry = bool(blur_score < 100)
 
-    skeleton = skeletonize(mask > 0).astype(np.uint8)
+    skeleton = build_skeleton_graph(mask)[0].astype(np.uint8)
     kernel = np.array([[1, 1, 1], [1, 10, 1], [1, 10, 1]], dtype=np.uint8)
     neighbors = cv2.filter2D(skeleton, -1, kernel)
     is_crossing = bool(np.any(neighbors > 12))
