@@ -12,6 +12,7 @@ from detectron2.engine import DefaultTrainer
 from detectron2.config import get_cfg
 from detectron2.data.datasets import register_coco_instances
 from detectron2 import model_zoo
+from detectron2.structures import BoxMode
 # Morphology
 from skimage.morphology import skeletonize
 from scipy.ndimage import distance_transform_edt
@@ -289,7 +290,7 @@ def load_coco_with_fibers(json_file, image_root):
         for ann_id, raw_ann in current_anns.items():
             obj = {
                 "bbox": raw_ann["bbox"],
-                "bbox_mode": 1, # BoxMode.XYWH_ABS (si tu utilises Detectron2)
+                "bbox_mode": BoxMode.XYWH_ABS,
                 "category_id": raw_ann["category_id"] - 1, # Conversion 0-indexed
                 "iscrowd": 0,
             }
@@ -308,7 +309,7 @@ def load_coco_with_fibers(json_file, image_root):
             obj["fiber_curvature"] = float(raw_ann.get("fiber_curvature", 0.0))
             obj["fiber_length"] = float(raw_ann.get("fiber_length", 0.0)) / 2000.0 
             obj["fiber_width"] = float(raw_ann.get("fiber_width", 0.0)) / 100.0
-            obj["fiber_orientation"] = float(raw_ann.get("fiber_orientation", [0.0, 0.0])) / 180.0
+            obj["fiber_orientation"] = float(raw_ann.get("fiber_orientation", 0.0)) / 180.0
             obj["has_bead"] = float(raw_ann.get("has_bead", 0.0))
             obj["porosity"] = float(raw_ann.get("porosity", img_info.get("porosity", 0.0)))
             # Pour l'orientation (souvent un vecteur [cos, sin])
@@ -342,7 +343,7 @@ def train():
     print("🚀 Démarrage de l'entraînement Detectron2 (FibeR-CNN)...")
 
     # 1. Nettoyage et Enregistrement du Dataset
-    if "fiber_train_v2" in DatasetCatalog:
+    if "fiber_train_v2" in DatasetCatalog.list():
         DatasetCatalog.remove("fiber_train_v2")
 
     DatasetCatalog.register(
@@ -364,7 +365,7 @@ def train():
     # 2. Configuration du Modèle
     cfg = get_cfg()
     cfg.merge_from_file(
-        model_zoo.get_config_file("COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml")
+        model_zoo.get_config_file("COCO-Keypoints/keypoint_rcnn_R_50_FPN_3x.yaml")
     )
 
     # --- INJECTION DES PARAMÈTRES PERSONNALISÉS ---
@@ -374,7 +375,8 @@ def train():
 
     # --- ALIGNEMENT DES HEADS ---
     # On enregistre la tête si ce n'est pas déjà fait
-    ROI_HEADS_REGISTRY.register(FiberROIHeadsV2) # À vérifier si déjà fait ailleurs
+    if "FiberROIHeadsV2" not in ROI_HEADS_REGISTRY:
+        ROI_HEADS_REGISTRY.register(FiberROIHeadsV2)
     cfg.MODEL.ROI_HEADS.NAME = "FiberROIHeadsV2"
     cfg.MODEL.ROI_HEADS.NUM_CLASSES = 1
     cfg.MODEL.ROI_KEYPOINT_HEAD.LOSS_WEIGHT = 10.0
@@ -386,6 +388,9 @@ def train():
     cfg.DATASETS.TRAIN = ("fiber_train_v2",)
     cfg.DATASETS.TEST = ()
     cfg.MODEL.DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    cfg.MODEL.WEIGHTS = model_zoo.get_checkpoint_url(
+        "COCO-Keypoints/keypoint_rcnn_R_50_FPN_3x.yaml"
+    )
     
     cfg.SOLVER.IMS_PER_BATCH = 2
     cfg.SOLVER.BASE_LR = 1e-5 

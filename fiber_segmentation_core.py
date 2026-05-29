@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 from pathlib import Path
 from typing import Any
 
@@ -818,3 +819,71 @@ def export_coco(
             indent=2,
         )
     return output_path
+
+
+def _default_categories(num_keypoints: int = 40) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": 1,
+            "name": "fiber",
+            "supercategory": "fiber",
+            "keypoints": [f"p{i + 1}" for i in range(num_keypoints)],
+            "skeleton": [[i + 1, i + 2] for i in range(num_keypoints - 1)],
+        }
+    ]
+
+
+def load_or_create_coco(coco_path: str | Path, num_keypoints: int = 40) -> dict[str, Any]:
+    coco_path = Path(coco_path)
+    if coco_path.exists():
+        with coco_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        data.setdefault("images", [])
+        data.setdefault("annotations", [])
+        data.setdefault("categories", _default_categories(num_keypoints))
+        return data
+    return {
+        "images": [],
+        "annotations": [],
+        "categories": _default_categories(num_keypoints),
+    }
+
+
+def upsert_image_annotations_in_coco(
+    coco_path: str | Path,
+    image_path: str | Path,
+    image: np.ndarray,
+    candidates: list[FiberCandidate],
+) -> Path:
+    coco_path = Path(coco_path)
+    image_path = Path(image_path)
+    coco = load_or_create_coco(coco_path)
+
+    image_lookup = {img["file_name"]: img for img in coco["images"]}
+    existing = image_lookup.get(image_path.name)
+    if existing is None:
+        image_id = max([img["id"] for img in coco["images"]], default=0) + 1
+        existing = {
+            "id": image_id,
+            "file_name": image_path.name,
+            "height": int(image.shape[0]),
+            "width": int(image.shape[1]),
+        }
+        coco["images"].append(existing)
+    else:
+        image_id = int(existing["id"])
+        existing["height"] = int(image.shape[0])
+        existing["width"] = int(image.shape[1])
+
+    coco["annotations"] = [ann for ann in coco["annotations"] if int(ann["image_id"]) != image_id]
+    next_ann_id = max([ann["id"] for ann in coco["annotations"]], default=0) + 1
+
+    for offset, candidate in enumerate(candidates):
+        coco["annotations"].append(
+            candidate.to_coco_annotation(image_id=image_id, annotation_id=next_ann_id + offset)
+        )
+
+    coco_path.parent.mkdir(parents=True, exist_ok=True)
+    with coco_path.open("w", encoding="utf-8") as f:
+        json.dump(coco, f, indent=2)
+    return coco_path

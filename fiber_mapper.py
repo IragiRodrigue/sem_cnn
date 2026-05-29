@@ -53,11 +53,13 @@ class FiberDatasetMapper(DatasetMapper):
         instances = utils.annotations_to_instances(
             annos, image.shape[:2], mask_format="polygon"
         )
+        instances, kept = utils.filter_empty_instances(instances, return_mask=True)
+        kept_annos = [anno for anno, keep in zip(annos, kept) if keep]
 
         # 3. Synchronisation des métriques personnalisées
         gt_length, gt_width, gt_orient, gt_curv, gt_bead, gt_porosity = [], [], [], [], [], []
         
-        for a in annos:
+        for a in kept_annos:
             # On vérifie si l'instance a survécu aux transformations (pas filtrée)
             gt_length.append(a.get("fiber_length", 0.0))
             gt_width.append(a.get("fiber_width", 0.0))

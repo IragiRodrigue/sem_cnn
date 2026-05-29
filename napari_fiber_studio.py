@@ -16,9 +16,9 @@ from fiber_segmentation_core import (
     assess_candidate_quality,
     build_candidate_from_mask,
     crop_percentage,
-    export_coco,
     mask_to_polygons,
     spline_mask_from_keypoints,
+    upsert_image_annotations_in_coco,
 )
 
 
@@ -26,6 +26,7 @@ from fiber_segmentation_core import (
 class ProposalMask:
     proposal_id: int
     mask: np.ndarray
+    refined_mask: np.ndarray
     source_variant: str
     score: float
     quality_ok: bool
@@ -45,6 +46,8 @@ class SessionState:
     interaction_mode: str = "select"
     next_proposal_id: int = 1
     next_instance_id: int = 1
+    image_paths: list[Path] = field(default_factory=list)
+    image_index: int = 0
 
 
 def run_app(image_path: str | None = None) -> None:
@@ -62,6 +65,7 @@ def run_app(image_path: str | None = None) -> None:
             QListWidget,
             QListWidgetItem,
             QPushButton,
+            QScrollArea,
             QSlider,
             QSpinBox,
             QVBoxLayout,
@@ -122,9 +126,36 @@ def run_app(image_path: str | None = None) -> None:
     if hasattr(prompt_points_layer, "border_width"):
         prompt_points_layer.border_width = 0.5
 
+    def log(message: str) -> None:
+        print(f"[FiberStudio] {message}")
+
+    def coco_output_path() -> Path:
+        return Path.cwd() / "coco_fiber.json"
+
+    def discover_images(anchor: Path | None = None) -> list[Path]:
+        search_dirs: list[Path] = []
+        if anchor is not None:
+            search_dirs.append(anchor.parent)
+        for candidate in [Path.cwd() / "images", Path.cwd() / "test_images", Path.cwd()]:
+            if candidate not in search_dirs:
+                search_dirs.append(candidate)
+        discovered: list[Path] = []
+        seen: set[Path] = set()
+        for directory in search_dirs:
+            if not directory.exists():
+                continue
+            for pattern in ("*.png", "*.jpg", "*.jpeg", "*.tif", "*.tiff"):
+                for path in sorted(directory.glob(pattern)):
+                    resolved = path.resolve()
+                    if resolved not in seen:
+                        seen.add(resolved)
+                        discovered.append(path)
+        return discovered
+
     def set_status(text: str) -> None:
         viewer.status = text
         status_label.setText(text)
+        log(text)
 
     def blank_state(shape: tuple[int, int]) -> None:
         state.proposals.clear()
@@ -164,6 +195,11 @@ def run_app(image_path: str | None = None) -> None:
         if image is None:
             set_status(f"Unable to read image: {path}")
             return
+        state.image_paths = discover_images(path)
+        try:
+            state.image_index = next(i for i, candidate in enumerate(state.image_paths) if candidate.resolve() == path.resolve())
+        except StopIteration:
+            state.image_index = 0
         cropped = crop_percentage(image, config.crop_bottom_percent)
         state.image_path = path
         state.working_image = cropped
@@ -172,6 +208,9 @@ def run_app(image_path: str | None = None) -> None:
         image_layer.contrast_limits = (float(np.min(cropped)), float(np.max(cropped)))
         viewer.reset_view()
         refresh_layers()
+        image_counter_label.setText(
+            f"{state.image_index + 1}/{max(len(state.image_paths), 1)}"
+        )
         set_status(f"Loaded {path.name}.")
 
     def update_list() -> None:
@@ -209,6 +248,7 @@ def run_app(image_path: str | None = None) -> None:
         update_instance_list()
         update_selected_keypoints()
         update_selection_overlays()
+        apply_mode_locks()
 
     def update_selection_overlays() -> None:
         if state.proposal_labels is None or state.instance_labels is None:
@@ -277,11 +317,14 @@ def run_app(image_path: str | None = None) -> None:
         )
         quality_ok = False
         quality_reason = "unresolved"
+        refined_mask = mask.copy()
         if candidate is not None:
             quality_ok, quality_reason = assess_candidate_quality(candidate, config)
+            refined_mask = candidate.final_mask.copy()
         proposal = ProposalMask(
             proposal_id=proposal_id,
             mask=mask.copy(),
+            refined_mask=refined_mask,
             source_variant=source_variant,
             score=float(score),
             quality_ok=quality_ok,
@@ -363,6 +406,33 @@ def run_app(image_path: str | None = None) -> None:
         }
         keypoints_layer.text = {"string": "{index}", "color": "yellow", "size": 9}
 
+    def sync_lists_to_selection() -> None:
+        if state.selected_proposal_id is None:
+            proposal_list.blockSignals(True)
+            proposal_list.clearSelection()
+            proposal_list.blockSignals(False)
+        else:
+            for idx in range(proposal_list.count()):
+                item = proposal_list.item(idx)
+                if int(item.data(Qt.UserRole)) == state.selected_proposal_id:
+                    proposal_list.blockSignals(True)
+                    proposal_list.setCurrentRow(idx)
+                    proposal_list.blockSignals(False)
+                    break
+
+        if state.selected_instance_id is None:
+            instance_list.blockSignals(True)
+            instance_list.clearSelection()
+            instance_list.blockSignals(False)
+        else:
+            for idx in range(instance_list.count()):
+                item = instance_list.item(idx)
+                if int(item.data(Qt.UserRole)) == state.selected_instance_id:
+                    instance_list.blockSignals(True)
+                    instance_list.setCurrentRow(idx)
+                    instance_list.blockSignals(False)
+                    break
+
     def select_proposal(proposal_id: int | None) -> None:
         state.selected_proposal_id = proposal_id
         if hasattr(proposal_layer, "selected_label"):
@@ -374,6 +444,7 @@ def run_app(image_path: str | None = None) -> None:
             )
         update_list()
         update_selection_overlays()
+        sync_lists_to_selection()
         update_color_maps()
 
     def select_instance(instance_id: int | None) -> None:
@@ -389,6 +460,7 @@ def run_app(image_path: str | None = None) -> None:
                     f"| width={candidate.fiber_width:.1f}px | spline IoU={candidate.spline_mask_iou:.2f}"
                 )
         update_selection_overlays()
+        sync_lists_to_selection()
         update_color_maps()
 
     def run_auto_sam() -> None:
@@ -421,7 +493,7 @@ def run_app(image_path: str | None = None) -> None:
         instance_labels = np.zeros(state.working_image.shape, dtype=np.int32)
         next_id = 1
         for proposal_id in sorted(state.proposals):
-            mask = state.proposals[proposal_id].mask > 0
+            mask = state.proposals[proposal_id].refined_mask > 0
             if not np.any(mask):
                 continue
             instance_labels[mask] = next_id
@@ -439,7 +511,7 @@ def run_app(image_path: str | None = None) -> None:
         if state.instance_labels is None:
             return
         proposal = state.proposals[state.selected_proposal_id]
-        state.instance_labels[proposal.mask > 0] = state.next_instance_id
+        state.instance_labels[proposal.refined_mask > 0] = state.next_instance_id
         state.selected_instance_id = state.next_instance_id
         state.next_instance_id += 1
         refresh_layers()
@@ -533,6 +605,34 @@ def run_app(image_path: str | None = None) -> None:
             set_status("Drag keypoints, then click Refine Spline.")
         else:
             set_status("Selection mode enabled.")
+        apply_mode_locks()
+
+    def apply_mode_locks() -> None:
+        for layer in [proposal_layer, instance_layer, selected_proposal_layer, selected_instance_layer, keypoints_layer, prompt_points_layer, roi_layer]:
+            if hasattr(layer, "editable"):
+                layer.editable = False
+
+        proposal_layer.visible = True
+        instance_layer.visible = True
+        selected_proposal_layer.visible = state.selected_proposal_id is not None
+        selected_instance_layer.visible = state.selected_instance_id is not None
+        keypoints_layer.visible = state.selected_instance_id is not None
+        prompt_points_layer.visible = state.interaction_mode in {"positive", "negative"}
+        roi_layer.visible = state.interaction_mode in {"roi_rect", "roi_poly"}
+
+        if state.interaction_mode in {"edit_instances", "erase_instances", "fill_instances"}:
+            instance_layer.editable = True
+            viewer.layers.selection.active = instance_layer
+        elif state.interaction_mode == "edit_keypoints":
+            keypoints_layer.editable = True if hasattr(keypoints_layer, "editable") else False
+            viewer.layers.selection.active = keypoints_layer
+        elif state.interaction_mode in {"roi_rect", "roi_poly"}:
+            roi_layer.editable = True
+            viewer.layers.selection.active = roi_layer
+        elif state.interaction_mode in {"positive", "negative"}:
+            viewer.layers.selection.active = image_layer
+        else:
+            viewer.layers.selection.active = image_layer
 
     def add_prompt_point(position_rc: tuple[float, float], label_value: int) -> None:
         current = np.asarray(prompt_points_layer.data, dtype=np.float32)
@@ -680,25 +780,37 @@ def run_app(image_path: str | None = None) -> None:
             )
         return candidates
 
-    def export_annotations() -> None:
+    def export_annotations() -> bool:
         if state.working_image is None or state.image_path is None:
             set_status("Load an image first.")
-            return
+            return False
         candidates = build_candidates_for_export()
         if not candidates:
             set_status("No instances available for export.")
-            return
-        default_output = state.image_path.with_suffix(".fiber.coco.json")
-        chosen, _ = QFileDialog.getSaveFileName(
-            viewer.window.qt_viewer,
-            "Export COCO",
-            str(default_output),
-            "JSON (*.json)",
+            return False
+        output_path = upsert_image_annotations_in_coco(
+            coco_output_path(),
+            state.image_path,
+            state.working_image,
+            candidates,
         )
-        if not chosen:
-            return
-        output_path = export_coco(state.image_path, state.working_image, candidates, chosen)
         set_status(f"COCO exported to {output_path}")
+        return True
+
+    def go_to_image(offset: int) -> None:
+        if not state.image_paths:
+            set_status("No image list available yet.")
+            return
+        next_index = state.image_index + offset
+        if next_index < 0 or next_index >= len(state.image_paths):
+            set_status("No more images in that direction.")
+            return
+        load_image(state.image_paths[next_index])
+
+    def save_and_next_image() -> None:
+        saved = export_annotations()
+        if saved and state.image_paths and state.image_index < len(state.image_paths) - 1:
+            go_to_image(1)
 
     def save_session() -> None:
         if state.working_image is None or state.image_path is None:
@@ -719,6 +831,7 @@ def run_app(image_path: str | None = None) -> None:
                 {
                     "proposal_id": proposal.proposal_id,
                     "mask": proposal.mask.tolist(),
+                    "refined_mask": proposal.refined_mask.tolist(),
                     "source_variant": proposal.source_variant,
                     "score": proposal.score,
                     "quality_ok": proposal.quality_ok,
@@ -752,6 +865,7 @@ def run_app(image_path: str | None = None) -> None:
             state.proposals[int(item["proposal_id"])] = ProposalMask(
                 proposal_id=int(item["proposal_id"]),
                 mask=np.asarray(item["mask"], dtype=np.uint8),
+                refined_mask=np.asarray(item.get("refined_mask", item["mask"]), dtype=np.uint8),
                 source_variant=item["source_variant"],
                 score=float(item["score"]),
                 quality_ok=bool(item["quality_ok"]),
@@ -759,8 +873,18 @@ def run_app(image_path: str | None = None) -> None:
                 metadata=item.get("metadata", {}),
             )
         state.next_proposal_id = int(payload.get("next_proposal_id", len(state.proposals) + 1))
-        state.instance_labels = np.asarray(payload.get("instance_labels"), dtype=np.int32)
-        state.next_instance_id = int(payload.get("next_instance_id", int(state.instance_labels.max()) + 1 if state.instance_labels is not None else 1))
+        raw_instance_labels = payload.get("instance_labels")
+        state.instance_labels = (
+            np.asarray(raw_instance_labels, dtype=np.int32)
+            if raw_instance_labels is not None
+            else np.zeros(state.working_image.shape, dtype=np.int32)
+        )
+        state.next_instance_id = int(
+            payload.get(
+                "next_instance_id",
+                int(state.instance_labels.max()) + 1 if state.instance_labels is not None else 1,
+            )
+        )
         state.selected_proposal_id = payload.get("selected_proposal_id")
         state.selected_instance_id = payload.get("selected_instance_id")
         rebuild_proposal_labels()
@@ -848,6 +972,8 @@ def run_app(image_path: str | None = None) -> None:
         control_layout.addWidget(button)
 
     make_button("Run Auto SAM", run_auto_sam)
+    make_button("Show Combined Masks", lambda: (setattr(proposal_layer, "visible", False), setattr(instance_layer, "visible", True), set_status("Showing combined instance masks only.")))
+    make_button("Show Proposals + Instances", lambda: (setattr(proposal_layer, "visible", True), setattr(instance_layer, "visible", True), set_status("Showing proposals and instance overlays.")))
     make_button("Create Instance Labels", create_instance_labels_from_proposals)
     make_button("Add Selected Proposal", add_selected_proposal_to_instances)
     make_button("Delete Selected Proposal", delete_selected_proposal)
@@ -869,6 +995,7 @@ def run_app(image_path: str | None = None) -> None:
     make_button("Compact Labels", relabel_instances_compact)
     make_button("Save Session", save_session)
     make_button("Load Session", load_session)
+    make_button("Save COCO + Next Image", save_and_next_image)
 
     separator = QFrame()
     separator.setFrameShape(QFrame.HLine)
@@ -916,7 +1043,10 @@ def run_app(image_path: str | None = None) -> None:
     status_label.setStyleSheet("font-size: 12px; color: #d7d7d7;")
     control_layout.addWidget(status_label)
     control_layout.addStretch(1)
-    viewer.window.add_dock_widget(control_widget, area="left", name="Parameters")
+    control_scroll = QScrollArea()
+    control_scroll.setWidgetResizable(True)
+    control_scroll.setWidget(control_widget)
+    viewer.window.add_dock_widget(control_scroll, area="left", name="Parameters")
 
     top_bar = QWidget()
     top_layout = QHBoxLayout(top_bar)
@@ -938,6 +1068,19 @@ def run_app(image_path: str | None = None) -> None:
 
     open_button.clicked.connect(open_dialog)
     top_layout.addWidget(open_button)
+
+    prev_button = QPushButton("Prev Image")
+    prev_button.setMinimumHeight(34)
+    prev_button.clicked.connect(lambda: go_to_image(-1))
+    top_layout.addWidget(prev_button)
+
+    next_button = QPushButton("Next Image")
+    next_button.setMinimumHeight(34)
+    next_button.clicked.connect(lambda: go_to_image(1))
+    top_layout.addWidget(next_button)
+
+    image_counter_label = QLabel("0/0")
+    top_layout.addWidget(image_counter_label)
 
     clear_prompt_button = QPushButton("Clear Prompts")
     clear_prompt_button.setMinimumHeight(34)
